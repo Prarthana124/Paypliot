@@ -1,0 +1,31 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-nexus-bg: #090B10;
+  --color-nexus-surface: #11151D;
+  --color-nexus-panel: #171C25;
+  --color-nexus-border: #232B38;
+  --color-nexus-lime: #C5F36A;
+  --color-nexus-cyan: #42DDF2;
+  --color-nexus-violet: #A58BFA;
+  --color-nexus-coral: #FF806B;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #090B10;
+  color: #F4F4F5;
+  overflow-x: hidden;
+}
+
+.nexus-grid-bg {
+  background-size: 32px 32px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+}
