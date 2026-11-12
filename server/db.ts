@@ -180,6 +180,33 @@ export function initDatabase() {
       details TEXT,
       timestamp TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS verification_runs (
+      id TEXT PRIMARY KEY,
+      run_type TEXT NOT NULL,
+      total_tests INTEGER NOT NULL,
+      passed_tests INTEGER NOT NULL,
+      failed_tests INTEGER NOT NULL,
+      waiting_tests INTEGER NOT NULL,
+      not_configured_tests INTEGER NOT NULL,
+      summary TEXT,
+      started_at TEXT NOT NULL,
+      completed_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS verification_results (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      group_name TEXT NOT NULL,
+      test_name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      status TEXT NOT NULL,
+      actual_result TEXT NOT NULL,
+      error_details TEXT,
+      evidence_ref TEXT,
+      executed_at TEXT NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES verification_runs (id)
+    );
   `);
 
   seedDefaultDataIfEmpty();

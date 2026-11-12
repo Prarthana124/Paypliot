@@ -3,7 +3,15 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { initDatabase, db, logAudit, computeSha256 } from './server/db.js';
-import { getPayPalConfig, createPayPalOrder, capturePayPalOrder, handleIncomingWebhook } from './server/paypal.js';
+import {
+  getPayPalConfig,
+  createPayPalOrder,
+  capturePayPalOrder,
+  handleIncomingWebhook,
+  getPayPalOrder,
+  testPayPalOAuth,
+  reconcilePaymentWithPayPal,
+} from './server/paypal.js';
 import {
   evaluateAuthorization,
   runProvisioningSimulation,
@@ -11,8 +19,19 @@ import {
   runReconciliation,
   generateIncidentAnalysis,
   executeRecovery,
+  rejectRecovery,
 } from './server/engine.js';
 import { runPresetScenario, seedDemoScenariosIfEmpty } from './server/scenarios.js';
+import {
+  runBackendVerification,
+  runPayPalSandboxVerification,
+  runProvisioningVerification,
+  runReconciliationScenarios,
+  runRecoveryVerification,
+  runAiVerification,
+  saveVerificationRun,
+  getLatestVerificationRun,
+} from './server/verification.js';
 
 dotenv.config();
 
@@ -333,6 +352,16 @@ app.post('/api/recovery/execute', (req: Request, res: Response) => {
   }
 });
 
+app.post('/api/recovery/reject', (req: Request, res: Response) => {
+  try {
+    const { proposalId, operator, reason } = req.body;
+    const result = rejectRecovery(proposalId, operator || 'OP-NEXUS-01', reason);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // 8. Evidence Vault & Chain Verification
 app.get('/api/evidence/verify-chain/:purchaseId', (req: Request, res: Response) => {
   const { purchaseId } = req.params;
@@ -441,6 +470,97 @@ app.post('/api/demo/reset', (_req: Request, res: Response) => {
 
     logAudit('DATABASE_RESET', 'OPERATOR', { message: 'Reset all transactions and re-seeded demo scenarios 1-4' });
     res.json({ success: true, message: 'Database reset to clean hackathon demo state' });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 11. System Verification Center Endpoints
+// ==========================================
+app.get('/api/verification/history', (_req: Request, res: Response) => {
+  try {
+    const latest = getLatestVerificationRun();
+    res.json(latest || { totalTests: 0, passedTests: 0, failedTests: 0, waitingTests: 0, notConfiguredTests: 0, tests: [] });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/verification/run-all', async (_req: Request, res: Response) => {
+  try {
+    const backend = await runBackendVerification();
+    const paypal = await runPayPalSandboxVerification();
+    const prov = await runProvisioningVerification();
+    const recon = await runReconciliationScenarios();
+    const recov = await runRecoveryVerification();
+    const ai = await runAiVerification();
+
+    const all = [...backend, ...paypal, ...prov, ...recon, ...recov, ...ai];
+    const summary = saveVerificationRun('ALL', all);
+    res.json(summary);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/verification/run-group', async (req: Request, res: Response) => {
+  try {
+    const { groupName } = req.body;
+    let tests: any[] = [];
+    if (groupName === 'BACKEND') tests = await runBackendVerification();
+    else if (groupName === 'PAYPAL_SANDBOX') tests = await runPayPalSandboxVerification();
+    else if (groupName === 'PROVISIONING') tests = await runProvisioningVerification();
+    else if (groupName === 'RECONCILIATION') tests = await runReconciliationScenarios();
+    else if (groupName === 'RECOVERY') tests = await runRecoveryVerification();
+    else if (groupName === 'AI_INTELLIGENCE') tests = await runAiVerification();
+    else return res.status(400).json({ error: `Unknown verification group: ${groupName}` });
+
+    const summary = saveVerificationRun(groupName, tests);
+    res.json(summary);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/verification/paypal/create-approval-order', async (req: Request, res: Response) => {
+  try {
+    const testPurId = `PUR-PAYPAL-INTERACTIVE-${Date.now().toString(36).toUpperCase()}`;
+    const amount = Number(req.body.amount) || 15.0;
+    const orderRes = await createPayPalOrder({
+      purchaseId: testPurId,
+      amount,
+      currency: 'USD',
+      productName: 'PayPal Interactive Sandbox Verification Token',
+    });
+
+    res.json({
+      purchaseId: testPurId,
+      orderId: orderRes.orderId,
+      approvalUrl: orderRes.approvalUrl,
+      mode: orderRes.mode,
+      status: orderRes.status,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/verification/paypal/check-order/:orderId', async (req: Request, res: Response) => {
+  try {
+    const { orderId } = req.params;
+    const order = await getPayPalOrder(orderId);
+    res.json(order);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/verification/paypal/capture-order/:orderId', async (req: Request, res: Response) => {
+  try {
+    const { orderId } = req.params;
+    const { purchaseId } = req.body;
+    const capture = await capturePayPalOrder(orderId, purchaseId || 'PUR-VERIF-CAPTURE');
+    res.json(capture);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

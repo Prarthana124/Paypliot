@@ -142,7 +142,7 @@ export function runProvisioningSimulation(
   attemptNumber = 1
 ) {
   const serviceId = `SVC-${serviceType.toUpperCase().replace(/\s+/g, '_')}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-  const opId = `OP-${Date.now().toString(36).toUpperCase()}`;
+  const opId = `OP-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
   const now = new Date().toISOString();
 
   let status: 'ACTIVE' | 'FAILED' | 'TIMEOUT' | 'PROVISIONING' = 'ACTIVE';
@@ -214,7 +214,7 @@ export function verifyDelivery(purchaseId: string) {
     .get(purchaseId) as any;
 
   const now = new Date().toISOString();
-  const verificationId = `VERIF-${Date.now().toString(36).toUpperCase()}`;
+  const verificationId = `VERIF-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
   if (!latestOp) {
     db.prepare(`
@@ -353,7 +353,7 @@ export function runReconciliation(purchaseId: string) {
     severity = 'LOW';
   }
 
-  const reconId = `REC-${Date.now().toString(36).toUpperCase()}`;
+  const reconId = `REC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
   const now = new Date().toISOString();
 
   db.prepare(`
@@ -372,7 +372,7 @@ export function runReconciliation(purchaseId: string) {
   // Manage Incidents:
   if (state !== 'FULLY_VERIFIED' && state !== 'AWAITING_PAYMENT') {
     const existingInc = db.prepare('SELECT id FROM incidents WHERE purchase_id = ?').get(purchaseId) as any;
-    const incId = existingInc ? existingInc.id : `INC-${Date.now().toString(36).toUpperCase()}`;
+    const incId = existingInc ? existingInc.id : `INC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
     if (existingInc) {
       db.prepare(`
@@ -398,7 +398,7 @@ export function runReconciliation(purchaseId: string) {
         actionName = 'Reconcile PayPal Canonical Capture';
       }
 
-      const propId = `PROP-${Date.now().toString(36).toUpperCase()}`;
+      const propId = `PROP-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
       db.prepare(`
         INSERT INTO recovery_proposals (id, incident_id, purchase_id, action_type, action_name, reason, requires_human_approval, approval_status, execution_status, created_at)
         VALUES (?, ?, ?, ?, ?, ?, 1, 'PENDING', 'NOT_EXECUTED', ?)
@@ -620,3 +620,40 @@ export function executeRecovery(proposalId: string, operator: string) {
     postReconciliationStatus: postRecon.status,
   };
 }
+
+export function rejectRecovery(proposalId: string, operator: string, reason?: string) {
+  const proposal = db.prepare('SELECT * FROM recovery_proposals WHERE id = ?').get(proposalId) as any;
+  if (!proposal) throw new Error(`Recovery proposal ${proposalId} not found`);
+
+  const now = new Date().toISOString();
+  const rejectionReason = reason || 'Declined by human supervisor clearance protocol.';
+
+  db.prepare(`
+    UPDATE recovery_proposals
+    SET approval_status = 'REJECTED', approved_by = ?, execution_status = 'FAILED', execution_result = ?, executed_at = ?
+    WHERE id = ?
+  `).run(operator, `REJECTED: ${rejectionReason}`, now, proposalId);
+
+  // Update incident status to DISMISSED or keep OPEN with rejected proposal
+  db.prepare(`UPDATE incidents SET status = 'DISMISSED' WHERE id = ?`).run(proposal.incident_id);
+
+  logAudit('RECOVERY_REJECTED', operator, {
+    proposalId,
+    purchaseId: proposal.purchase_id,
+    reason: rejectionReason,
+  });
+
+  appendEvidenceRecord(proposal.purchase_id, 'RECOVERY_PROPOSAL_REJECTED', 'HUMAN_SUPERVISOR', {
+    proposalId,
+    operator,
+    rejectionReason,
+  });
+
+  return {
+    success: true,
+    proposalId,
+    approvalStatus: 'REJECTED',
+    rejectionReason,
+  };
+}
+

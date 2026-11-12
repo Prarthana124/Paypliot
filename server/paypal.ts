@@ -249,3 +249,148 @@ export function handleIncomingWebhook(eventData: any, headers: Record<string, st
 
   return { status: 'RECORDED', eventId, signatureStatus };
 }
+
+export async function testPayPalOAuth(): Promise<{
+  success: boolean;
+  appId?: string;
+  tokenType?: string;
+  expiresIn?: number;
+  mode: string;
+  error?: string;
+}> {
+  const config = getPayPalConfig();
+  if (!config.isConfigured) {
+    return {
+      success: false,
+      mode: 'DEMO',
+      error: 'PayPal credentials not configured in environment',
+    };
+  }
+
+  try {
+    const auth = Buffer.from(`${config.clientId}:${config.clientSecret}`).toString('base64');
+    const res = await fetch('https://api-m.sandbox.paypal.com/v1/oauth2/token', {
+      method: 'POST',
+      headers: {
+        Authorization: `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return {
+        success: false,
+        mode: 'LIVE_SANDBOX',
+        error: `HTTP ${res.status}: ${errText}`,
+      };
+    }
+
+    const data = (await res.json()) as any;
+    return {
+      success: true,
+      appId: data.app_id,
+      tokenType: data.token_type,
+      expiresIn: data.expires_in,
+      mode: 'LIVE_SANDBOX',
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      mode: 'LIVE_SANDBOX',
+      error: err.message,
+    };
+  }
+}
+
+export async function getPayPalOrder(orderId: string): Promise<{
+  orderId: string;
+  status: string;
+  intent?: string;
+  approvalUrl?: string;
+  amount?: string;
+  currency?: string;
+  raw?: any;
+}> {
+  const config = getPayPalConfig();
+  if (config.isConfigured && !orderId.startsWith('ORD-DEMO-')) {
+    const accessToken = await getAccessToken(config);
+    const res = await fetch(`https://api-m.sandbox.paypal.com/v2/checkout/orders/${orderId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`PayPal order retrieve failed: HTTP ${res.status} - ${errText}`);
+    }
+
+    const data = (await res.json()) as any;
+    const approvalUrl = data.links?.find((l: any) => l.rel === 'approve')?.href;
+    const amountVal = data.purchase_units?.[0]?.amount?.value;
+    const currencyVal = data.purchase_units?.[0]?.amount?.currency_code;
+
+    return {
+      orderId: data.id,
+      status: data.status,
+      intent: data.intent,
+      approvalUrl,
+      amount: amountVal,
+      currency: currencyVal,
+      raw: data,
+    };
+  }
+
+  // Demo fallback
+  const payment = db.prepare('SELECT * FROM paypal_payments WHERE paypal_order_id = ?').get(orderId) as any;
+  return {
+    orderId,
+    status: payment?.status || 'CREATED',
+    intent: 'CAPTURE',
+    approvalUrl: `https://www.sandbox.paypal.com/checkoutnow?token=${orderId}`,
+    amount: payment ? payment.amount.toFixed(2) : '30.00',
+    currency: payment ? payment.currency : 'USD',
+    raw: { mode: 'DEMO' },
+  };
+}
+
+export async function reconcilePaymentWithPayPal(purchaseId: string) {
+  const payment = db.prepare('SELECT * FROM paypal_payments WHERE purchase_id = ?').get(purchaseId) as any;
+  if (!payment) {
+    throw new Error(`No payment record found for purchase ${purchaseId}`);
+  }
+
+  const config = getPayPalConfig();
+  if (config.isConfigured && !payment.paypal_order_id.startsWith('ORD-DEMO-')) {
+    const liveOrder = await getPayPalOrder(payment.paypal_order_id);
+    const localStatus = payment.status;
+    const remoteStatus = liveOrder.status;
+    const isMatched = localStatus === remoteStatus || (localStatus === 'FAILED' && remoteStatus === 'CREATED');
+
+    return {
+      purchaseId,
+      orderId: payment.paypal_order_id,
+      localStatus,
+      remoteStatus,
+      matches: isMatched,
+      mode: 'LIVE_SANDBOX',
+      discrepancy: isMatched ? null : `Local status '${localStatus}' differs from PayPal remote status '${remoteStatus}'.`,
+      remoteOrder: liveOrder,
+    };
+  }
+
+  return {
+    purchaseId,
+    orderId: payment.paypal_order_id,
+    localStatus: payment.status,
+    remoteStatus: payment.status,
+    matches: true,
+    mode: 'DEMO',
+    discrepancy: null,
+  };
+}
+

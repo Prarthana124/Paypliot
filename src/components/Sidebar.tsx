@@ -10,11 +10,13 @@ import {
   Lock, 
   Cable, 
   Settings,
-  AlertCircle
+  AlertCircle,
+  CheckCheck
 } from 'lucide-react';
 
 export type NavTab = 
   | 'command_center' 
+  | 'system_verification'
   | 'agent_registry' 
   | 'authorization_lab' 
   | 'transaction_explorer' 
@@ -40,6 +42,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const navItems = [
     { key: 'command_center', label: 'Command Center', icon: LayoutDashboard },
+    { key: 'system_verification', label: 'System Verification', icon: CheckCheck, isSpecial: true, badge: '52', badgeColor: 'bg-[#C5F36A] text-[#090B10]' },
     { key: 'agent_registry', label: 'Agent Registry', icon: Bot },
     { key: 'authorization_lab', label: 'Authorization Lab', icon: ShieldCheck },
     { key: 'transaction_explorer', label: 'Transaction Explorer', icon: Layers },

@@ -11,6 +11,7 @@ import { RecoveryCenter } from './components/RecoveryCenter';
 import { EvidenceVault } from './components/EvidenceVault';
 import { IntegrationsView } from './components/IntegrationsView';
 import { SettingsView } from './components/SettingsView';
+import { SystemVerificationView } from './components/SystemVerificationView';
 import { NewTransactionModal } from './components/NewTransactionModal';
 import { 
   Agent, 
@@ -218,6 +219,10 @@ export default function App() {
               onRunDemoScenario={handleRunDemoScenario}
               onNavigateToTab={setCurrentTab}
             />
+          )}
+
+          {currentTab === 'system_verification' && (
+            <SystemVerificationView />
           )}
 
           {currentTab === 'agent_registry' && (

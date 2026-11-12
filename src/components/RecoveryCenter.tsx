@@ -28,8 +28,11 @@ export const RecoveryCenter: React.FC<RecoveryCenterProps> = ({
 }) => {
   const [selectedProposal, setSelectedProposal] = useState<RecoveryProposal | null>(proposals[0] || null);
   const [showApprovalModal, setShowApprovalModal] = useState(false);
+  const [showRejectModal, setShowRejectModal] = useState(false);
+  const [rejectionReason, setRejectionReason] = useState('Declined by supervisor following forensic telemetry review.');
   const [operatorId, setOperatorId] = useState('OP-NEXUS-01');
   const [isExecuting, setIsExecuting] = useState(false);
+  const [isRejecting, setIsRejecting] = useState(false);
   const [executionDiff, setExecutionDiff] = useState<any | null>(null);
 
   const handleExecute = async () => {
@@ -56,6 +59,28 @@ export const RecoveryCenter: React.FC<RecoveryCenterProps> = ({
       console.error(e);
     } finally {
       setIsExecuting(false);
+    }
+  };
+
+  const handleReject = async () => {
+    if (!selectedProposal) return;
+    setIsRejecting(true);
+    try {
+      await fetch('/api/recovery/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          proposalId: selectedProposal.id,
+          operator: operatorId,
+          reason: rejectionReason,
+        }),
+      });
+      setShowRejectModal(false);
+      onRefresh();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsRejecting(false);
     }
   };
 
@@ -192,13 +217,22 @@ export const RecoveryCenter: React.FC<RecoveryCenterProps> = ({
                   </button>
 
                   {selectedProposal.approval_status === 'PENDING' && (
-                    <button
-                      onClick={() => setShowApprovalModal(true)}
-                      className="px-4 py-2 text-xs font-bold text-[#090B10] bg-[#C5F36A] hover:bg-[#b0df57] rounded-lg transition-colors flex items-center gap-1.5 shadow-[0_0_12px_rgba(197,243,106,0.25)]"
-                    >
-                      <UserCheck className="w-4 h-4" />
-                      <span>Review & Approve Action</span>
-                    </button>
+                    <>
+                      <button
+                        onClick={() => setShowRejectModal(true)}
+                        className="px-3.5 py-1.5 text-xs font-semibold text-[#FF806B] bg-[#FF806B]/10 hover:bg-[#FF806B]/20 border border-[#FF806B]/30 rounded-lg transition-colors flex items-center gap-1.5"
+                      >
+                        <XCircle className="w-4 h-4" />
+                        <span>Reject Proposal</span>
+                      </button>
+                      <button
+                        onClick={() => setShowApprovalModal(true)}
+                        className="px-4 py-2 text-xs font-bold text-[#090B10] bg-[#C5F36A] hover:bg-[#b0df57] rounded-lg transition-colors flex items-center gap-1.5 shadow-[0_0_12px_rgba(197,243,106,0.25)]"
+                      >
+                        <UserCheck className="w-4 h-4" />
+                        <span>Review & Approve Action</span>
+                      </button>
+                    </>
                   )}
                 </div>
               </div>
@@ -312,6 +346,71 @@ export const RecoveryCenter: React.FC<RecoveryCenterProps> = ({
               >
                 <Play className="w-3.5 h-3.5 fill-current" />
                 <span>{isExecuting ? 'Executing Recovery...' : 'Authorize & Execute'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Human Supervisor Rejection Modal */}
+      {showRejectModal && selectedProposal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4">
+          <div className="bg-[#11151D] border border-[#FF806B]/40 rounded-2xl w-full max-w-lg p-6 shadow-2xl space-y-5">
+            <div className="flex items-center gap-3 pb-4 border-b border-[#232B38]">
+              <div className="p-2.5 rounded-xl bg-[#FF806B]/10 text-[#FF806B]">
+                <XCircle className="w-6 h-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-[#F4F4F5]">Reject Recovery Proposal</h3>
+                <p className="text-xs text-[#A1A1AA] font-mono">Proposal: {selectedProposal.action_name}</p>
+              </div>
+            </div>
+
+            <div className="text-xs text-[#A1A1AA] space-y-2 leading-relaxed">
+              <p>
+                You are declining proposed action <strong className="text-[#F4F4F5] font-mono">{selectedProposal.action_name}</strong> for transaction <span className="text-[#42DDF2] font-mono">{selectedProposal.purchase_id}</span>.
+              </p>
+              <p className="text-[#FF806B]">
+                This will record an operator rejection in the immutable audit ledger and dismiss the automated recommendation.
+              </p>
+            </div>
+
+            <div>
+              <label className="text-[11px] font-mono uppercase text-[#A1A1AA] block mb-1">Reason for Rejection</label>
+              <textarea
+                rows={3}
+                value={rejectionReason}
+                onChange={e => setRejectionReason(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-[#171C25] border border-[#232B38] text-xs font-mono text-[#F4F4F5] focus:outline-hidden focus:border-[#FF806B]"
+              />
+            </div>
+
+            <div>
+              <label className="text-[11px] font-mono uppercase text-[#A1A1AA] block mb-1">Operator Signature</label>
+              <input
+                type="text"
+                value={operatorId}
+                onChange={e => setOperatorId(e.target.value)}
+                className="w-full px-3 py-2 rounded-xl bg-[#171C25] border border-[#232B38] text-xs font-mono text-[#F4F4F5]"
+              />
+            </div>
+
+            <div className="flex justify-end gap-2 pt-4 border-t border-[#232B38]">
+              <button
+                type="button"
+                onClick={() => setShowRejectModal(false)}
+                className="px-4 py-2 text-xs rounded-xl bg-[#171C25] text-[#A1A1AA] hover:text-[#F4F4F5]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={isRejecting}
+                onClick={handleReject}
+                className="px-4 py-2 text-xs font-bold rounded-xl bg-[#FF806B] text-[#090B10] hover:bg-[#ff6e54] transition-colors flex items-center gap-1.5"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                <span>{isRejecting ? 'Rejecting...' : 'Confirm Rejection'}</span>
               </button>
             </div>
           </div>
