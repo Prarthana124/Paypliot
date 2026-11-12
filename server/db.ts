@@ -212,6 +212,17 @@ export function initDatabase() {
   seedDefaultDataIfEmpty();
 }
 
+export function canonicalizeJson(obj: any): string {
+  if (obj === null || typeof obj !== 'object') {
+    return JSON.stringify(obj);
+  }
+  if (Array.isArray(obj)) {
+    return '[' + obj.map((item) => canonicalizeJson(item)).join(',') + ']';
+  }
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map((key) => JSON.stringify(key) + ':' + canonicalizeJson(obj[key])).join(',') + '}';
+}
+
 export function computeSha256(data: string): string {
   return crypto.createHash('sha256').update(data).digest('hex');
 }
@@ -231,7 +242,7 @@ export function appendEvidenceRecord(
   const prevHash = lastRecord?.current_hash || '0000000000000000000000000000000000000000000000000000000000000000';
   const recordedAt = new Date().toISOString();
   const id = `EVD-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
-  const payloadStr = JSON.stringify(payloadObject);
+  const payloadStr = canonicalizeJson(payloadObject);
 
   const hashInput = `${id}|${purchaseId}|${eventType}|${sourceEntity}|${payloadStr}|${prevHash}|${recordedAt}`;
   const currentHash = computeSha256(hashInput);

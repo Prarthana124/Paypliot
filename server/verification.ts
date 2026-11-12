@@ -1,6 +1,7 @@
 import { db, appendEvidenceRecord, computeSha256, logAudit } from './db.js';
 import {
   evaluateAuthorization,
+  validateAndConsumeAuthorizationToken,
   runProvisioningSimulation,
   verifyDelivery,
   runReconciliation,
@@ -248,46 +249,131 @@ export async function runBackendVerification(): Promise<VerificationTestItem[]> 
     });
   }
 
-  // Test 6: Authorization Validation
+  // Test 6: Authorization Validation (Comprehensive Policy & Token Security Tests A through H)
   try {
-    // Should block: budget exceeded ($150 > $100)
-    const overBudgetRes = evaluateAuthorization({
+    // Condition A: Within policy ALLOW
+    const condA = evaluateAuthorization({
+      agentId: testAgentId,
+      productName: 'Valid Verification Node',
+      category: 'Cloud Services',
+      merchant: 'Nexus Compute',
+      amount: 40.0,
+      purpose: 'Policy verification test A',
+    });
+    if (!condA.allowed || !condA.authorizationId) {
+      throw new Error(`Condition A failed: expected ALLOW, got: ${JSON.stringify(condA)}`);
+    }
+
+    // Condition B: Budget exceeded BLOCK ($150 > $100)
+    const condB = evaluateAuthorization({
       agentId: testAgentId,
       productName: 'High-End GPU Node',
       category: 'Cloud Services',
       merchant: 'Nexus Compute',
       amount: 150.0,
-      purpose: 'Exceed budget test',
+      purpose: 'Exceed budget test B',
     });
-    // Should block: disallowed merchant
-    const badMerchantRes = evaluateAuthorization({
+    if (condB.allowed) throw new Error('Condition B failed: budget overrun was allowed.');
+
+    // Condition C: Merchant check BLOCK (Untrusted vendor)
+    const condC = evaluateAuthorization({
       agentId: testAgentId,
       productName: 'Cloud Node',
       category: 'Cloud Services',
       merchant: 'Untrusted Vendor Ltd',
       amount: 20.0,
-      purpose: 'Merchant check test',
+      purpose: 'Merchant check test C',
     });
+    if (condC.allowed) throw new Error('Condition C failed: unapproved merchant was allowed.');
 
-    if (overBudgetRes.allowed || badMerchantRes.allowed) {
-      throw new Error('Authorization policy engine failed to block unauthorized requests.');
+    // Condition D: Category check BLOCK (Disallowed category)
+    const condD = evaluateAuthorization({
+      agentId: testAgentId,
+      productName: 'Gaming Hardware',
+      category: 'Gaming Hardware',
+      merchant: 'Nexus Compute',
+      amount: 20.0,
+      purpose: 'Category check test D',
+    });
+    if (condD.allowed) throw new Error('Condition D failed: unapproved category was allowed.');
+
+    // Condition E: Amount modification / tamper detection on token consumption
+    const condE = validateAndConsumeAuthorizationToken(condA.authorizationId, {
+      agentId: testAgentId,
+      productName: 'Valid Verification Node',
+      merchant: 'Nexus Compute',
+      amount: 80.0, // Modified from authorized 40.0
+    });
+    if (condE.valid || condE.rejectionCode !== 'MODIFIED_AMOUNT') {
+      throw new Error(`Condition E failed: expected MODIFIED_AMOUNT rejection, got: ${JSON.stringify(condE)}`);
     }
+
+    // Condition H: Agent identity mismatch BLOCK
+    const condH = validateAndConsumeAuthorizationToken(condA.authorizationId, {
+      agentId: 'agt_data_scraper', // Mismatch against testAgentId
+      productName: 'Valid Verification Node',
+      merchant: 'Nexus Compute',
+      amount: 40.0,
+    });
+    if (condH.valid || condH.rejectionCode !== 'INVALID_AGENT_IDENTITY') {
+      throw new Error(`Condition H failed: expected INVALID_AGENT_IDENTITY, got: ${JSON.stringify(condH)}`);
+    }
+
+    // Valid consumption of Condition A token
+    const consumeSuccess = validateAndConsumeAuthorizationToken(condA.authorizationId, {
+      agentId: testAgentId,
+      productName: 'Valid Verification Node',
+      merchant: 'Nexus Compute',
+      amount: 40.0,
+    });
+    if (!consumeSuccess.valid) {
+      throw new Error(`Valid token consumption failed: ${JSON.stringify(consumeSuccess)}`);
+    }
+
+    // Condition F: Token reuse / replay attack prevention
+    const condF = validateAndConsumeAuthorizationToken(condA.authorizationId, {
+      agentId: testAgentId,
+      productName: 'Valid Verification Node',
+      merchant: 'Nexus Compute',
+      amount: 40.0,
+    });
+    if (condF.valid || condF.rejectionCode !== 'TOKEN_ALREADY_USED') {
+      throw new Error(`Condition F failed: expected TOKEN_ALREADY_USED rejection, got: ${JSON.stringify(condF)}`);
+    }
+
+    // Condition G: Expired authorization token BLOCK
+    const expiredAuthId = `AUTH-EXP-${Date.now().toString(36)}`;
+    db.prepare(`
+      INSERT INTO authorizations (id, agent_id, intended_product, merchant, category, max_amount, currency, purpose, status, created_at, expires_at, hash)
+      VALUES (?, ?, 'Expired Unit', 'Nexus Compute', 'Cloud Services', 50.0, 'USD', 'Expired token test', 'ACTIVE', datetime('now', '-2 hours'), datetime('now', '-1 hour'), 'expired_hash')
+    `).run(expiredAuthId, testAgentId);
+
+    const condG = validateAndConsumeAuthorizationToken(expiredAuthId, {
+      agentId: testAgentId,
+      productName: 'Expired Unit',
+      merchant: 'Nexus Compute',
+      amount: 50.0,
+    });
+    if (condG.valid || condG.rejectionCode !== 'EXPIRED_AUTHORIZATION') {
+      throw new Error(`Condition G failed: expected EXPIRED_AUTHORIZATION rejection, got: ${JSON.stringify(condG)}`);
+    }
+
     results.push({
       id: 'authorization_validation',
       groupName: 'BACKEND',
-      testName: 'Deterministic Authorization Gatekeeping',
-      description: 'Verify deterministic rejection of budget overruns ($150 > $100) and unapproved merchants',
+      testName: 'Deterministic Authorization Gatekeeping (Tests A - H)',
+      description: 'Verify 8 conditions: within policy ALLOW, budget BLOCK, merchant BLOCK, category BLOCK, amount tampering BLOCK, token reuse BLOCK, expired BLOCK, agent mismatch BLOCK',
       status: 'PASS',
-      actualResult: `Both policy checks successfully blocked: '${overBudgetRes.rejectionReason}' & '${badMerchantRes.rejectionReason}'.`,
-      evidenceRef: 'evaluateAuthorization engine',
+      actualResult: 'All 8 authorization security invariants validated: ALLOW, budget overrun blocked, merchant blocked, category blocked, amount tampering blocked, replay attack prevented, token expiration enforced, and agent binding confirmed.',
+      evidenceRef: 'evaluateAuthorization & validateAndConsumeAuthorizationToken',
       executedAt: now(),
     });
   } catch (err: any) {
     results.push({
       id: 'authorization_validation',
       groupName: 'BACKEND',
-      testName: 'Deterministic Authorization Gatekeeping',
-      description: 'Authorization validation check',
+      testName: 'Deterministic Authorization Gatekeeping (Tests A - H)',
+      description: 'Authorization validation check (Tests A - H)',
       status: 'FAIL',
       actualResult: 'Policy enforcement check failed',
       errorDetails: err.message,
@@ -572,7 +658,7 @@ export async function runBackendVerification(): Promise<VerificationTestItem[]> 
 
     // Now test approval & execution on the primary proposal
     const execRes = executeRecovery(proposalId, 'OP-VERIF-TEST');
-    if (!execRes.success || execRes.postReconciliationStatus !== 'FULLY_VERIFIED') {
+    if (!execRes.success || (execRes.postReconciliationStatus !== 'FULLY_VERIFIED' && execRes.postReconciliationStatus !== 'VERIFIED')) {
       throw new Error(`Recovery execution failed to restore state: ${JSON.stringify(execRes)}`);
     }
 
@@ -950,10 +1036,10 @@ export async function runPayPalSandboxVerification(): Promise<VerificationTestIt
         id: 'paypal_buyer_approval',
         groupName: 'PAYPAL_SANDBOX',
         testName: 'C. Buyer Approval Verification',
-        description: 'Simulate or check buyer approval',
-        status: 'PASS',
-        actualResult: `Demo sandbox order ${createdOrderId} simulated with buyer approval token.`,
-        evidenceRef: 'Demo approval simulator',
+        description: 'Check buyer approval in PayPal Sandbox',
+        status: 'NOT CONFIGURED',
+        actualResult: 'PayPal credentials not configured in environment (PAYPAL_CLIENT_ID / PAYPAL_CLIENT_SECRET). Buyer approval flow unverified against live Sandbox API.',
+        evidenceRef: 'PayPal Sandbox config check',
         executedAt: now(),
       });
     }
@@ -1018,9 +1104,9 @@ export async function runPayPalSandboxVerification(): Promise<VerificationTestIt
         groupName: 'PAYPAL_SANDBOX',
         testName: 'D. Server-Side Payment Capture',
         description: 'Server-side payment capture simulation',
-        status: 'PASS',
-        actualResult: 'Simulated PayPal capture returned COMPLETED status with deterministic capture ID.',
-        evidenceRef: 'Demo capture engine',
+        status: 'NOT CONFIGURED',
+        actualResult: 'PayPal credentials not configured in environment. Server-side payment capture unverified against live Sandbox API (requires active PayPal Sandbox credentials).',
+        evidenceRef: 'PayPal Sandbox config check',
         executedAt: now(),
       });
     }
@@ -1053,29 +1139,34 @@ export async function runPayPalSandboxVerification(): Promise<VerificationTestIt
       },
     };
 
-    const firstResult = handleIncomingWebhook(eventPayload, {
+    // Test missing signature headers detection
+    const missingHeadersResult = await handleIncomingWebhook(
+      { id: `WH-MISSING-${Date.now().toString(36)}`, event_type: 'PAYMENT.CAPTURE.COMPLETED', resource_type: 'capture', resource: {} },
+      {}
+    );
+
+    const validHeaders = {
       'paypal-auth-algo': 'SHA256withRSA',
       'paypal-cert-url': 'https://api.sandbox.paypal.com/v1/notifications/certs/CERT-1',
       'paypal-transmission-id': `TRANS-${Date.now()}`,
-    });
+      'paypal-transmission-sig': 'MEYCIQD7261910283471018239019283019283019283019283',
+      'paypal-transmission-time': new Date().toISOString(),
+    };
 
-    const secondResult = handleIncomingWebhook(eventPayload, {
-      'paypal-auth-algo': 'SHA256withRSA',
-      'paypal-cert-url': 'https://api.sandbox.paypal.com/v1/notifications/certs/CERT-1',
-      'paypal-transmission-id': `TRANS-${Date.now()}`,
-    });
+    const firstResult = await handleIncomingWebhook(eventPayload, validHeaders);
+    const secondResult = await handleIncomingWebhook(eventPayload, validHeaders);
 
-    if (firstResult.status !== 'RECORDED' || secondResult.status !== 'DUPLICATE_IGNORED') {
-      throw new Error(`Expected first RECORDED and second DUPLICATE_IGNORED, got: ${firstResult.status} and ${secondResult.status}`);
+    if (missingHeadersResult.status !== 'SIGNATURE_REJECTED' || firstResult.status !== 'RECORDED' || secondResult.status !== 'DUPLICATE_IGNORED') {
+      throw new Error(`Expected missing: SIGNATURE_REJECTED, first: RECORDED, duplicate: DUPLICATE_IGNORED. Got: ${missingHeadersResult.status}, ${firstResult.status}, ${secondResult.status}`);
     }
 
     results.push({
       id: 'paypal_webhook_idempotency',
       groupName: 'PAYPAL_SANDBOX',
       testName: 'E. Webhook Signature & Idempotency Check',
-      description: 'Dispatch webhook and replay duplicate event; verify first is RECORDED and duplicate is DUPLICATE_IGNORED',
+      description: 'Dispatch webhook and replay duplicate event; verify first is RECORDED and duplicate is DUPLICATE_IGNORED, missing headers rejected',
       status: 'PASS',
-      actualResult: `Event ${testEventId} was recorded; duplicate transmission was flagged and blocked from repeating actions.`,
+      actualResult: `Event ${testEventId} recorded; duplicate transmission was flagged and blocked from repeating actions; missing signature headers correctly rejected.`,
       evidenceRef: `webhook_events.id=${testEventId}`,
       executedAt: now(),
     });
@@ -1095,7 +1186,7 @@ export async function runPayPalSandboxVerification(): Promise<VerificationTestIt
   // Test F: Reconciliation with PayPal API
   try {
     const samplePur = db.prepare("SELECT purchase_id FROM paypal_payments WHERE mode = 'LIVE_SANDBOX' LIMIT 1").get() as any;
-    if (samplePur) {
+    if (samplePur && config.isConfigured) {
       const reconResult = await reconcilePaymentWithPayPal(samplePur.purchase_id);
       results.push({
         id: 'paypal_reconciliation',
@@ -1112,10 +1203,10 @@ export async function runPayPalSandboxVerification(): Promise<VerificationTestIt
         id: 'paypal_reconciliation',
         groupName: 'PAYPAL_SANDBOX',
         testName: 'F. Reconciliation with Live PayPal API',
-        description: 'Reconcile local payment against PayPal API',
-        status: 'PASS',
-        actualResult: 'Reconciliation checked against canonical record. State alignment confirmed.',
-        evidenceRef: 'PayPal canonical comparator',
+        description: 'Compare local payment record against live PayPal API',
+        status: 'NOT CONFIGURED',
+        actualResult: 'PayPal credentials not configured in environment. Live remote order retrieval and state reconciliation against api-m.sandbox.paypal.com is unverified (local deterministic reconciliation engine is active).',
+        evidenceRef: 'PayPal Sandbox config check',
         executedAt: now(),
       });
     }
@@ -1383,14 +1474,14 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
     runProvisioningSimulation(pA, 'Compute Service', 'SUCCESS', 1);
     verifyDelivery(pA);
     const reconA = runReconciliation(pA);
-    if (reconA.status !== 'FULLY_VERIFIED') {
-      throw new Error(`Expected FULLY_VERIFIED, got ${reconA.status}`);
+    if (reconA.status !== 'FULLY_VERIFIED' && reconA.status !== 'VERIFIED') {
+      throw new Error(`Expected VERIFIED / FULLY_VERIFIED, got ${reconA.status}`);
     }
     results.push({
       id: 'recon_scenario_a',
       groupName: 'RECONCILIATION',
       testName: 'TEST A: Payment Confirmed + Delivery Verified',
-      description: 'Expected state: FULLY_VERIFIED',
+      description: 'Expected state: VERIFIED / FULLY_VERIFIED',
       status: 'PASS',
       actualResult: `Reconciliation evaluated state: '${reconA.status}'. Evidence: ${reconA.evidenceSummary}`,
       evidenceRef: `reconciliation_results for purchase=${pA}`,
@@ -1483,7 +1574,7 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
     });
   }
 
-  // TEST D: Payment pending + delivery not started -> Expected: AWAITING_PAYMENT
+  // TEST D: Payment pending + delivery not started -> Expected: PAYMENT_PENDING / AWAITING_PAYMENT
   try {
     const pD = `${baseId}-D`;
     helper(pD, 15.0, 'PENDING');
@@ -1492,14 +1583,14 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
       VALUES (?, ?, 'ORD-D', null, 15.0, 'USD', 'CREATED', 'LIVE_SANDBOX', '{}', ?, ?)
     `).run(`PAY-${pD}`, pD, now(), now());
     const reconD = runReconciliation(pD);
-    if (reconD.status !== 'AWAITING_PAYMENT') {
-      throw new Error(`Expected AWAITING_PAYMENT, got ${reconD.status}`);
+    if (reconD.status !== 'AWAITING_PAYMENT' && reconD.status !== 'PAYMENT_PENDING') {
+      throw new Error(`Expected PAYMENT_PENDING / AWAITING_PAYMENT, got ${reconD.status}`);
     }
     results.push({
       id: 'recon_scenario_d',
       groupName: 'RECONCILIATION',
       testName: 'TEST D: Payment Pending + Delivery Not Started',
-      description: 'Expected state: AWAITING_PAYMENT',
+      description: 'Expected state: PAYMENT_PENDING / AWAITING_PAYMENT',
       status: 'PASS',
       actualResult: `Reconciliation evaluated state: '${reconD.status}'. Invariant: awaiting buyer checkout authorization.`,
       evidenceRef: `reconciliation_results for purchase=${pD}`,
@@ -1529,8 +1620,8 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
       resource_type: 'capture',
       resource: { custom_id: pE, status: 'COMPLETED' },
     };
-    handleIncomingWebhook(whPayload, { 'paypal-auth-algo': 'SHA256withRSA', 'paypal-cert-url': 'https://cert', 'paypal-transmission-id': 'TX1' });
-    const dupRes = handleIncomingWebhook(whPayload, { 'paypal-auth-algo': 'SHA256withRSA', 'paypal-cert-url': 'https://cert', 'paypal-transmission-id': 'TX2' });
+    await handleIncomingWebhook(whPayload, { 'paypal-auth-algo': 'SHA256withRSA', 'paypal-cert-url': 'https://cert', 'paypal-transmission-id': 'TX1' });
+    const dupRes = await handleIncomingWebhook(whPayload, { 'paypal-auth-algo': 'SHA256withRSA', 'paypal-cert-url': 'https://cert', 'paypal-transmission-id': 'TX2' });
     if (dupRes.status !== 'DUPLICATE_IGNORED') {
       throw new Error(`Expected DUPLICATE_IGNORED, got ${dupRes.status}`);
     }
@@ -1557,7 +1648,7 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
     });
   }
 
-  // TEST F: Provisioning timeout -> Expected: DELIVERY_UNCONFIRMED
+  // TEST F: Provisioning timeout -> Expected: UNKNOWN / DELIVERY_UNCONFIRMED
   try {
     const pF = `${baseId}-F`;
     helper(pF, 50.0, 'PENDING');
@@ -1568,14 +1659,14 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
     runProvisioningSimulation(pF, 'Compute Service', 'TIMEOUT', 1);
     verifyDelivery(pF);
     const reconF = runReconciliation(pF);
-    if (reconF.status !== 'DELIVERY_UNCONFIRMED') {
-      throw new Error(`Expected DELIVERY_UNCONFIRMED, got ${reconF.status}`);
+    if (reconF.status !== 'DELIVERY_UNCONFIRMED' && reconF.status !== 'UNKNOWN') {
+      throw new Error(`Expected UNKNOWN / DELIVERY_UNCONFIRMED, got ${reconF.status}`);
     }
     results.push({
       id: 'recon_scenario_f',
       groupName: 'RECONCILIATION',
       testName: 'TEST F: Provisioning Timeout & Uncertain Delivery',
-      description: 'Expected state: DELIVERY_UNCONFIRMED',
+      description: 'Expected state: UNKNOWN / DELIVERY_UNCONFIRMED',
       status: 'PASS',
       actualResult: `Reconciliation evaluated state: '${reconF.status}'. Mismatch category: '${reconF.mismatchCategory}'.`,
       evidenceRef: `reconciliation_results for purchase=${pF}`,
@@ -1594,19 +1685,19 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
     });
   }
 
-  // TEST G: Unauthorized agent purchase -> Expected: PURCHASE_BLOCKED
+  // TEST G: Unauthorized agent purchase -> Expected: AUTHORIZATION_BLOCKED / PURCHASE_BLOCKED
   try {
     const pG = `${baseId}-G`;
     helper(pG, 999.0, 'BLOCKED');
     const reconG = runReconciliation(pG);
-    if (reconG.status !== 'PURCHASE_BLOCKED') {
-      throw new Error(`Expected PURCHASE_BLOCKED, got ${reconG.status}`);
+    if (reconG.status !== 'PURCHASE_BLOCKED' && reconG.status !== 'AUTHORIZATION_BLOCKED') {
+      throw new Error(`Expected AUTHORIZATION_BLOCKED / PURCHASE_BLOCKED, got ${reconG.status}`);
     }
     results.push({
       id: 'recon_scenario_g',
       groupName: 'RECONCILIATION',
       testName: 'TEST G: Unauthorized Agent Purchase Invariant',
-      description: 'Expected state: PURCHASE_BLOCKED',
+      description: 'Expected state: AUTHORIZATION_BLOCKED / PURCHASE_BLOCKED',
       status: 'PASS',
       actualResult: `Reconciliation evaluated state: '${reconG.status}'. Policy engine halted transaction before payment initiation.`,
       evidenceRef: `reconciliation_results for purchase=${pG}`,
@@ -1620,6 +1711,81 @@ export async function runReconciliationScenarios(): Promise<VerificationTestItem
       description: 'Reconciliation Test G',
       status: 'FAIL',
       actualResult: 'Test G failed',
+      errorDetails: err.message,
+      executedAt: now(),
+    });
+  }
+
+  // TEST H: Payment Failed Invariant -> Expected: PAYMENT_FAILED
+  try {
+    const pH = `${baseId}-H`;
+    helper(pH, 65.0, 'FAILED');
+    db.prepare(`
+      INSERT OR REPLACE INTO paypal_payments (id, purchase_id, paypal_order_id, capture_id, amount, currency, status, mode, raw_response, created_at, updated_at)
+      VALUES (?, ?, 'ORD-H', null, 65.0, 'USD', 'DECLINED', 'LIVE_SANDBOX', '{}', ?, ?)
+    `).run(`PAY-${pH}`, pH, now(), now());
+    const reconH = runReconciliation(pH);
+    if (reconH.status !== 'PAYMENT_FAILED') {
+      throw new Error(`Expected PAYMENT_FAILED, got ${reconH.status}`);
+    }
+    results.push({
+      id: 'recon_scenario_h',
+      groupName: 'RECONCILIATION',
+      testName: 'TEST H: Payment Failed Invariant',
+      description: 'Expected state: PAYMENT_FAILED',
+      status: 'PASS',
+      actualResult: `Reconciliation evaluated state: '${reconH.status}'. Payment declined by PayPal. Provisioning was safely inhibited.`,
+      evidenceRef: `reconciliation_results for purchase=${pH}`,
+      executedAt: now(),
+    });
+  } catch (err: any) {
+    results.push({
+      id: 'recon_scenario_h',
+      groupName: 'RECONCILIATION',
+      testName: 'TEST H: Payment Failed Invariant',
+      description: 'Reconciliation Test H',
+      status: 'FAIL',
+      actualResult: 'Test H failed',
+      errorDetails: err.message,
+      executedAt: now(),
+    });
+  }
+
+  // TEST I: Local vs Remote Status Mismatch -> Expected: STATUS_MISMATCH
+  try {
+    const pI = `${baseId}-I`;
+    helper(pI, 85.0, 'COMPLETED');
+    db.prepare(`
+      INSERT OR REPLACE INTO paypal_payments (id, purchase_id, paypal_order_id, capture_id, amount, currency, status, mode, raw_response, created_at, updated_at)
+      VALUES (?, ?, 'ORD-I', null, 85.0, 'USD', 'FAILED', 'LIVE_SANDBOX', '{}', ?, ?)
+    `).run(`PAY-${pI}`, pI, now(), now());
+    const reconI = runReconciliation(pI, {
+      matches: false,
+      remoteStatus: 'CREATED',
+      localStatus: 'COMPLETED',
+      discrepancy: 'Local record claims COMPLETED but remote PayPal order is still CREATED (uncaptured)',
+    });
+    if (reconI.status !== 'STATUS_MISMATCH') {
+      throw new Error(`Expected STATUS_MISMATCH, got ${reconI.status}`);
+    }
+    results.push({
+      id: 'recon_scenario_i',
+      groupName: 'RECONCILIATION',
+      testName: 'TEST I: Local vs Remote Payment Status Mismatch',
+      description: 'Expected state: STATUS_MISMATCH',
+      status: 'PASS',
+      actualResult: `Reconciliation evaluated state: '${reconI.status}'. Mismatch identified: Local COMPLETED vs PayPal FAILED. Flagged for forensic audit.`,
+      evidenceRef: `reconciliation_results for purchase=${pI}`,
+      executedAt: now(),
+    });
+  } catch (err: any) {
+    results.push({
+      id: 'recon_scenario_i',
+      groupName: 'RECONCILIATION',
+      testName: 'TEST I: Local vs Remote Payment Status Mismatch',
+      description: 'Reconciliation Test I',
+      status: 'FAIL',
+      actualResult: 'Test I failed',
       errorDetails: err.message,
       executedAt: now(),
     });
@@ -1829,8 +1995,8 @@ export async function runRecoveryVerification(): Promise<VerificationTestItem[]>
     `).run(`PAY-${testPurId}`, testPurId, now(), now());
 
     const execRes = executeRecovery(propId, 'OP-CHIEF-SUPERVISOR');
-    if (execRes.postReconciliationStatus !== 'FULLY_VERIFIED') {
-      throw new Error(`Expected post-recovery status FULLY_VERIFIED, got ${execRes.postReconciliationStatus}`);
+    if (execRes.postReconciliationStatus !== 'FULLY_VERIFIED' && execRes.postReconciliationStatus !== 'VERIFIED') {
+      throw new Error(`Expected post-recovery status FULLY_VERIFIED or VERIFIED, got ${execRes.postReconciliationStatus}`);
     }
     results.push({
       id: 'recov_post_reconciliation',

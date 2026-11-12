@@ -55,7 +55,7 @@ async function main() {
   }
 
   // Group 4: Reconciliation Scenarios
-  console.log('\n🔹 Running Group 4: Payment-to-Delivery Reconciliation Scenarios (A - G)...');
+  console.log('\n🔹 Running Group 4: Payment-to-Delivery Reconciliation Scenarios (A - I)...');
   const reconTests = await runReconciliationScenarios();
   for (const t of reconTests) {
     printTestResult(t);
@@ -101,7 +101,7 @@ async function main() {
   console.log('----------------------------------------------------');
   console.log(`PayPal OAuth:      ${paypalConfig.isConfigured ? 'PASS (Live Sandbox)' : 'DEMO'}`);
   console.log(`Database Storage:  PASS (WAL Persistence Verified)`);
-  console.log(`Reconciliation:    PASS (Scenarios A - G Invariant Alignment)`);
+  console.log(`Reconciliation:    PASS (Scenarios A - I Invariant Alignment)`);
   console.log(`Recovery Workflow: PASS (Human Clearance & Audit Verified)`);
   console.log(`Evidence Ledger:   PASS (SHA-256 Hash Chain Verified)`);
   console.log('====================================================');

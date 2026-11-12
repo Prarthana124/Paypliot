@@ -14,6 +14,7 @@ import {
 } from './server/paypal.js';
 import {
   evaluateAuthorization,
+  validateAndConsumeAuthorizationToken,
   runProvisioningSimulation,
   verifyDelivery,
   runReconciliation,
@@ -35,12 +36,16 @@ import {
 
 dotenv.config();
 
+// Protect process from unhandled asynchronous rejections
+process.on('uncaughtException', (err) => {
+  console.error('[PAYPILOT] Uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[PAYPILOT] Unhandled rejection at:', promise, 'reason:', reason);
+});
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Initialize DB and Seed default data
-initDatabase();
-seedDemoScenariosIfEmpty();
 
 const app = express();
 app.use(express.json());
@@ -205,36 +210,64 @@ app.get('/api/purchases/:id', (req: Request, res: Response) => {
 
 app.post('/api/purchases', async (req: Request, res: Response) => {
   try {
-    const { agentId, productName, serviceType, merchant, amount, currency, simulateOutcome } = req.body;
+    const { agentId, productName, serviceType, merchant, amount, currency, simulateOutcome, authorizationId } = req.body;
     const now = new Date().toISOString();
     const purchaseId = `PUR-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 5).toUpperCase()}`;
 
-    // 1. Authorization Check
-    const authResult = evaluateAuthorization({
-      agentId,
-      productName,
-      category: serviceType.includes('Storage') ? 'Storage' : serviceType.includes('Monitoring') ? 'Monitoring' : 'Cloud Services',
-      merchant,
-      amount: Number(amount),
-      currency: currency || 'USD',
-      purpose: `Autonomous purchase of ${productName}`,
-    });
+    let activeAuthId: string | null = null;
 
-    if (!authResult.allowed) {
-      db.prepare(`
-        INSERT INTO purchases (id, agent_id, authorization_id, product_name, service_type, merchant, amount, currency, status, scenario_tag, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(purchaseId, agentId, null, productName, serviceType, merchant, Number(amount), currency || 'USD', 'BLOCKED', 'CUSTOM_AUTH_BLOCKED', now, now);
+    // If caller provided an authorization token, strictly validate and consume it (Replay & Tamper Check)
+    if (authorizationId) {
+      const tokenCheck = validateAndConsumeAuthorizationToken(authorizationId, {
+        agentId,
+        productName,
+        merchant,
+        amount: Number(amount),
+        currency: currency || 'USD',
+      });
 
-      runReconciliation(purchaseId);
-      return res.status(200).json({ purchaseId, status: 'BLOCKED', reason: authResult.rejectionReason });
+      if (!tokenCheck.valid) {
+        db.prepare(`
+          INSERT INTO purchases (id, agent_id, authorization_id, product_name, service_type, merchant, amount, currency, status, scenario_tag, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(purchaseId, agentId, authorizationId, productName, serviceType, merchant, Number(amount), currency || 'USD', 'BLOCKED', 'TOKEN_VIOLATION_BLOCKED', now, now);
+
+        runReconciliation(purchaseId);
+        return res.status(200).json({ purchaseId, status: 'BLOCKED', reason: tokenCheck.rejectionReason, code: tokenCheck.rejectionCode });
+      }
+      activeAuthId = authorizationId;
+    } else {
+      // 1. Dynamic Authorization Evaluation
+      const authResult = evaluateAuthorization({
+        agentId,
+        productName,
+        category: serviceType.includes('Storage') ? 'Storage' : serviceType.includes('Monitoring') ? 'Monitoring' : 'Cloud Services',
+        merchant,
+        amount: Number(amount),
+        currency: currency || 'USD',
+        purpose: `Autonomous purchase of ${productName}`,
+      });
+
+      if (!authResult.allowed) {
+        db.prepare(`
+          INSERT INTO purchases (id, agent_id, authorization_id, product_name, service_type, merchant, amount, currency, status, scenario_tag, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(purchaseId, agentId, null, productName, serviceType, merchant, Number(amount), currency || 'USD', 'BLOCKED', 'CUSTOM_AUTH_BLOCKED', now, now);
+
+        runReconciliation(purchaseId);
+        return res.status(200).json({ purchaseId, status: 'BLOCKED', reason: authResult.rejectionReason });
+      }
+
+      activeAuthId = authResult.authorizationId;
+      // Mark token consumed for this transaction
+      db.prepare("UPDATE authorizations SET status = 'USED' WHERE id = ?").run(activeAuthId);
     }
 
     // 2. Create Purchase Record
     db.prepare(`
       INSERT INTO purchases (id, agent_id, authorization_id, product_name, service_type, merchant, amount, currency, status, scenario_tag, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(purchaseId, agentId, authResult.authorizationId, productName, serviceType, merchant, Number(amount), currency || 'USD', 'PENDING', 'CUSTOM_RUN', now, now);
+    `).run(purchaseId, agentId, activeAuthId, productName, serviceType, merchant, Number(amount), currency || 'USD', 'PENDING', 'CUSTOM_RUN', now, now);
 
     // 3. PayPal Order & Capture
     const order = await createPayPalOrder({
@@ -245,11 +278,12 @@ app.post('/api/purchases', async (req: Request, res: Response) => {
     });
     const capture = await capturePayPalOrder(order.orderId, purchaseId);
 
+    const payId = `PAY-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
     db.prepare(`
       INSERT INTO paypal_payments (id, purchase_id, paypal_order_id, capture_id, amount, currency, status, mode, raw_response, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      `PAY-${Date.now().toString(36)}`,
+      payId,
       purchaseId,
       order.orderId,
       capture.captureId,
@@ -299,10 +333,14 @@ app.get('/api/paypal/config', (_req: Request, res: Response) => {
   });
 });
 
-app.post('/api/paypal/webhooks', (req: Request, res: Response) => {
-  const headers = req.headers as Record<string, string | undefined>;
-  const result = handleIncomingWebhook(req.body, headers);
-  res.json(result);
+app.post('/api/paypal/webhooks', async (req: Request, res: Response) => {
+  try {
+    const headers = req.headers as Record<string, string | undefined>;
+    const result = await handleIncomingWebhook(req.body, headers);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // 6. Incidents & AI Analysis
@@ -400,6 +438,70 @@ app.get('/api/evidence/verify-chain/:purchaseId', (req: Request, res: Response) 
     disclaimer: 'A cryptographic SHA-256 hash proves that recorded evidence has not changed since hashing. It does not independently prove that the underlying event was truthful.',
     records: records.map((r) => ({ ...r, payload: JSON.parse(r.payload || '{}') })),
   });
+});
+
+app.get('/api/evidence/export-markdown/:purchaseId', (req: Request, res: Response) => {
+  const { purchaseId } = req.params;
+  const purchase = db.prepare('SELECT p.*, ag.name as agent_name FROM purchases p JOIN agents ag ON p.agent_id = ag.id WHERE p.id = ?').get(purchaseId) as any;
+  if (!purchase) {
+    return res.status(404).send('# Error: Transaction not found');
+  }
+
+  const records = db.prepare('SELECT * FROM evidence_records WHERE purchase_id = ? ORDER BY recorded_at ASC, id ASC').all(purchaseId) as any[];
+  const recon = db.prepare('SELECT * FROM reconciliation_results WHERE purchase_id = ? ORDER BY reconciled_at DESC LIMIT 1').get(purchaseId) as any;
+
+  let isValid = true;
+  let previousHash = '0000000000000000000000000000000000000000000000000000000000000000';
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    if (r.prev_hash !== previousHash || computeSha256(`${r.id}|${r.purchase_id}|${r.event_type}|${r.source_entity}|${r.payload}|${r.prev_hash}|${r.recorded_at}`) !== r.current_hash) {
+      isValid = false;
+      break;
+    }
+    previousHash = r.current_hash;
+  }
+
+  const md = `# PAYPILOT FORENSIC INCIDENT & EVIDENCE REPORT
+**Transaction ID**: ${purchase.id}
+**Agent**: ${purchase.agent_name} (\`${purchase.agent_id}\`)
+**Product / Service**: ${purchase.product_name} (${purchase.service_type})
+**Merchant**: ${purchase.merchant}
+**Amount**: $${Number(purchase.amount).toFixed(2)} ${purchase.currency}
+**Reconciliation Status**: ${recon?.status || purchase.status}
+**Generated At**: ${new Date().toISOString()}
+
+---
+
+## 1. Cryptographic Hash Chain Audit
+- **Chain Integrity Status**: ${isValid ? 'VERIFIED_INTACT (SHA-256)' : 'CORRUPTED / TAMPER DETECTED'}
+- **Total Evidence Records**: ${records.length}
+- **Hash Standard**: SHA-256 with Canonical JSON Serialization
+
+> **Cryptographic Invariant Notice**:
+> A cryptographic SHA-256 hash proves that recorded evidence has not changed since hashing. It does not independently prove that the underlying event was truthful.
+
+---
+
+## 2. Chronological Evidence Records
+${records.map((r, i) => `### Record ${i + 1}: ${r.event_type}
+- **ID**: \`${r.id}\`
+- **Source**: \`${r.source_entity}\`
+- **Timestamp**: ${r.recorded_at}
+- **Previous Hash**: \`${r.prev_hash}\`
+- **Current Hash**: \`${r.current_hash}\`
+
+\`\`\`json
+${JSON.stringify(JSON.parse(r.payload || '{}'), null, 2)}
+\`\`\`
+`).join('\n')}
+
+---
+*Report generated by PAYPILOT Nexus Mode — Autonomous Commerce Intelligence Platform.*
+`;
+
+  res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="paypilot-evidence-${purchaseId}.md"`);
+  res.send(md);
 });
 
 // 9. Integrations Status
@@ -566,10 +668,31 @@ app.post('/api/verification/paypal/capture-order/:orderId', async (req: Request,
   }
 });
 
-// Vite server configuration
+// Server lifecycle and bootstrap
 async function startServer() {
+  try {
+    initDatabase();
+    await seedDemoScenariosIfEmpty();
+  } catch (err) {
+    console.warn('[PAYPILOT] Initial database bootstrap warning:', err);
+  }
+
   const isProd = process.env.NODE_ENV === 'production';
-  const port = 3000;
+  const args = process.argv.slice(2);
+  let port = 3000;
+  let host = '0.0.0.0';
+
+  for (let i = 0; i < args.length; i++) {
+    if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
+      port = parseInt(args[i + 1], 10) || 3000;
+    }
+    if ((args[i] === '--host' || args[i] === '-H') && args[i + 1]) {
+      host = args[i + 1];
+    }
+  }
+  if (process.env.PORT) {
+    port = parseInt(process.env.PORT, 10) || port;
+  }
 
   if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
@@ -588,8 +711,8 @@ async function startServer() {
     });
   }
 
-  const server = app.listen(port, '0.0.0.0', () => {
-    console.log(`PAYPILOT Nexus server running at http://localhost:${port}`);
+  const server = app.listen(port, host, () => {
+    console.log(`PAYPILOT Nexus server running at http://${host}:${port}`);
   });
 
   server.on('error', (err: any) => {

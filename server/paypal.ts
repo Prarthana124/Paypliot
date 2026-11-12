@@ -193,14 +193,71 @@ export async function capturePayPalOrder(orderId: string, purchaseId: string) {
   };
 }
 
-export function handleIncomingWebhook(eventData: any, headers: Record<string, string | undefined>) {
+export async function verifyPayPalWebhookSignature(
+  eventData: any,
+  headers: Record<string, string | undefined>
+): Promise<'VERIFIED' | 'FAILED' | 'MISSING_SIGNATURE_HEADERS' | 'SIMULATED_VERIFIED'> {
+  const authAlgo = headers['paypal-auth-algo'];
+  const certUrl = headers['paypal-cert-url'];
+  const transmissionId = headers['paypal-transmission-id'];
+  const transmissionSig = headers['paypal-transmission-sig'];
+  const transmissionTime = headers['paypal-transmission-time'];
+
+  if (!authAlgo || !certUrl || !transmissionId || !transmissionSig || !transmissionTime) {
+    return 'MISSING_SIGNATURE_HEADERS';
+  }
+
+  const config = getPayPalConfig();
+  const webhookId = process.env.PAYPAL_WEBHOOK_ID;
+
+  if (config.isConfigured && webhookId) {
+    try {
+      const accessToken = await getAccessToken(config);
+      const res = await fetch('https://api-m.sandbox.paypal.com/v1/notifications/verify-webhook-signature', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          auth_algo: authAlgo,
+          cert_url: certUrl,
+          transmission_id: transmissionId,
+          transmission_sig: transmissionSig,
+          transmission_time: transmissionTime,
+          webhook_id: webhookId,
+          webhook_event: eventData,
+        }),
+      });
+
+      if (res.ok) {
+        const data = (await res.json()) as { verification_status: string };
+        return data.verification_status === 'SUCCESS' ? 'VERIFIED' : 'FAILED';
+      }
+      return 'FAILED';
+    } catch (err: any) {
+      console.warn('[PayPal Webhook] Live signature verification API call failed:', err.message);
+      return 'FAILED';
+    }
+  }
+
+  // If in DEMO mode (credentials not configured in environment), accurately report SIMULATED_VERIFIED
+  // so the system never falsely claims an external PayPal API verified the signature
+  if (transmissionSig && transmissionSig.length >= 16 && certUrl && certUrl.includes('paypal.com')) {
+    return 'SIMULATED_VERIFIED';
+  }
+
+  return 'FAILED';
+}
+
+export async function handleIncomingWebhook(eventData: any, headers: Record<string, string | undefined>) {
   const eventId = eventData.id || `WH-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   const eventType = eventData.event_type || 'PAYMENT.CAPTURE.COMPLETED';
   const resourceType = eventData.resource_type || 'capture';
   const purchaseId = eventData.resource?.custom_id || eventData.resource?.supplementary_data?.related_ids?.order_id || null;
 
-  // Check idempotency:
-  const existing = db.prepare('SELECT id FROM webhook_events WHERE id = ?').get(eventId);
+  // Enforce Idempotency: Reject duplicate webhook deliveries
+  const existing = db.prepare('SELECT id, signature_status FROM webhook_events WHERE id = ?').get(eventId) as any;
   if (existing) {
     db.prepare(`
       INSERT INTO webhook_events (id, purchase_id, event_type, resource_type, signature_status, payload, is_duplicate, received_at)
@@ -210,20 +267,15 @@ export function handleIncomingWebhook(eventData: any, headers: Record<string, st
       purchaseId,
       eventType,
       resourceType,
-      'VERIFIED',
+      existing.signature_status,
       JSON.stringify(eventData),
       new Date().toISOString()
     );
-    return { status: 'DUPLICATE_IGNORED', eventId };
+    return { status: 'DUPLICATE_IGNORED', eventId, reason: 'Duplicate webhook transmission ignored by idempotency engine' };
   }
 
-  // Signature check: In real PayPal, we query verify-webhook-signature; in Demo, we verify headers
-  const authAlgo = headers['paypal-auth-algo'];
-  const certUrl = headers['paypal-cert-url'];
-  const transmissionId = headers['paypal-transmission-id'];
-  const signatureStatus = (authAlgo && certUrl && transmissionId) || getPayPalConfig().mode === 'DEMO' 
-    ? 'VERIFIED' 
-    : 'UNVERIFIED';
+  // Official Signature Verification
+  const signatureStatus = await verifyPayPalWebhookSignature(eventData, headers);
 
   db.prepare(`
     INSERT INTO webhook_events (id, purchase_id, event_type, resource_type, signature_status, payload, is_duplicate, received_at)
@@ -238,6 +290,20 @@ export function handleIncomingWebhook(eventData: any, headers: Record<string, st
     new Date().toISOString()
   );
 
+  // If signature was not verified (or missing headers), DO NOT mutate financial records
+  if (signatureStatus === 'FAILED' || signatureStatus === 'MISSING_SIGNATURE_HEADERS') {
+    if (purchaseId) {
+      appendEvidenceRecord(purchaseId, 'PAYPAL_WEBHOOK_REJECTED', 'WEBHOOK_SECURITY_FILTER', {
+        eventId,
+        eventType,
+        signatureStatus,
+        reason: 'Untrusted webhook signature or missing transmission headers',
+      });
+    }
+    return { status: 'SIGNATURE_REJECTED', eventId, signatureStatus };
+  }
+
+  // Verified event handling
   if (purchaseId) {
     appendEvidenceRecord(purchaseId, 'PAYPAL_WEBHOOK_RECEIVED', 'PAYPAL_WEBHOOK', {
       eventId,
@@ -245,6 +311,21 @@ export function handleIncomingWebhook(eventData: any, headers: Record<string, st
       signatureStatus,
       resourceSummary: eventData.resource?.id || null,
     });
+
+    // Authoritative state updates
+    if (eventType === 'PAYMENT.CAPTURE.COMPLETED') {
+      db.prepare(`
+        UPDATE paypal_payments 
+        SET status = 'COMPLETED', capture_id = COALESCE(?, capture_id), updated_at = ? 
+        WHERE purchase_id = ?
+      `).run(eventData.resource?.id || null, new Date().toISOString(), purchaseId);
+    } else if (eventType === 'PAYMENT.CAPTURE.DENIED' || eventType === 'PAYMENT.CAPTURE.DECLINED') {
+      db.prepare(`
+        UPDATE paypal_payments 
+        SET status = 'DECLINED', updated_at = ? 
+        WHERE purchase_id = ?
+      `).run(new Date().toISOString(), purchaseId);
+    }
   }
 
   return { status: 'RECORDED', eventId, signatureStatus };
@@ -369,7 +450,32 @@ export async function reconcilePaymentWithPayPal(purchaseId: string) {
     const liveOrder = await getPayPalOrder(payment.paypal_order_id);
     const localStatus = payment.status;
     const remoteStatus = liveOrder.status;
-    const isMatched = localStatus === remoteStatus || (localStatus === 'FAILED' && remoteStatus === 'CREATED');
+
+    // Strict state comparison: CREATED != COMPLETED; FAILED != CREATED
+    let isMatched = false;
+    let discrepancy: string | null = null;
+
+    if (localStatus === 'COMPLETED' && remoteStatus === 'COMPLETED') {
+      isMatched = true;
+    } else if (localStatus === 'CREATED' && remoteStatus === 'CREATED') {
+      isMatched = true;
+    } else if (localStatus === 'APPROVED' && remoteStatus === 'APPROVED') {
+      isMatched = true;
+    } else if ((localStatus === 'DECLINED' || localStatus === 'FAILED') && (remoteStatus === 'VOIDED' || remoteStatus === 'FAILED')) {
+      isMatched = true;
+    } else {
+      isMatched = false;
+      discrepancy = `Local payment status '${localStatus}' contradicts remote PayPal canonical status '${remoteStatus}'.`;
+    }
+
+    // Verify amount & currency
+    if (isMatched && liveOrder.amount) {
+      const remoteAmt = parseFloat(liveOrder.amount);
+      if (Math.abs(remoteAmt - payment.amount) > 0.01) {
+        isMatched = false;
+        discrepancy = `Amount mismatch: local amount $${payment.amount.toFixed(2)} differs from remote PayPal order amount $${remoteAmt.toFixed(2)}`;
+      }
+    }
 
     return {
       purchaseId,
@@ -378,11 +484,12 @@ export async function reconcilePaymentWithPayPal(purchaseId: string) {
       remoteStatus,
       matches: isMatched,
       mode: 'LIVE_SANDBOX',
-      discrepancy: isMatched ? null : `Local status '${localStatus}' differs from PayPal remote status '${remoteStatus}'.`,
+      discrepancy,
       remoteOrder: liveOrder,
     };
   }
 
+  // DEMO MODE comparison
   return {
     purchaseId,
     orderId: payment.paypal_order_id,

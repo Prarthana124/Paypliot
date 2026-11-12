@@ -63,11 +63,12 @@ export async function runPresetScenario(scenarioNumber: 1 | 2 | 3 | 4) {
 
     const capture = await capturePayPalOrder(order.orderId, purchaseId);
 
+    const payId = `PAY-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
     db.prepare(`
       INSERT INTO paypal_payments (id, purchase_id, paypal_order_id, capture_id, amount, currency, status, mode, raw_response, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      `PAY-${Date.now().toString(36)}`,
+      payId,
       purchaseId,
       order.orderId,
       capture.captureId,
@@ -147,11 +148,12 @@ export async function runPresetScenario(scenarioNumber: 1 | 2 | 3 | 4) {
     });
     const capture = await capturePayPalOrder(order.orderId, purchaseId);
 
+    const payId2 = `PAY-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
     db.prepare(`
       INSERT INTO paypal_payments (id, purchase_id, paypal_order_id, capture_id, amount, currency, status, mode, raw_response, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      `PAY-${Date.now().toString(36)}`,
+      payId2,
       purchaseId,
       order.orderId,
       capture.captureId,
@@ -223,11 +225,12 @@ export async function runPresetScenario(scenarioNumber: 1 | 2 | 3 | 4) {
 
     // PayPal payment recorded as FAILED or DECLINED
     const mockOrderId = `ORD-DECLINED-${Date.now().toString(36).toUpperCase()}`;
+    const payId3 = `PAY-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 7)}`;
     db.prepare(`
       INSERT INTO paypal_payments (id, purchase_id, paypal_order_id, capture_id, amount, currency, status, mode, raw_response, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      `PAY-${Date.now().toString(36)}`,
+      payId3,
       purchaseId,
       mockOrderId,
       null,
@@ -308,13 +311,17 @@ export async function runPresetScenario(scenarioNumber: 1 | 2 | 3 | 4) {
   }
 }
 
-export function seedDemoScenariosIfEmpty() {
-  const purchaseCount = db.prepare('SELECT COUNT(*) as count FROM purchases').get() as { count: number };
-  if (purchaseCount.count === 0) {
-    // Run scenario 1, 2, and 3 so the dashboard has rich, realistic data right upon launch!
-    runPresetScenario(1);
-    runPresetScenario(2);
-    runPresetScenario(3);
-    runPresetScenario(4);
+export async function seedDemoScenariosIfEmpty() {
+  try {
+    const purchaseCount = db.prepare('SELECT COUNT(*) as count FROM purchases').get() as { count: number };
+    if (purchaseCount.count === 0) {
+      // Run scenarios 1, 2, 3, and 4 sequentially to populate initial data reliably
+      await runPresetScenario(1);
+      await runPresetScenario(2);
+      await runPresetScenario(3);
+      await runPresetScenario(4);
+    }
+  } catch (err) {
+    console.warn('[PAYPILOT] Seeding demo scenarios warning:', err);
   }
 }

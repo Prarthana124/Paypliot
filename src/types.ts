@@ -31,13 +31,19 @@ export interface Authorization {
 }
 
 export type ReconciliationState =
+  | 'VERIFIED'
   | 'FULLY_VERIFIED'
+  | 'PAYMENT_PENDING'
+  | 'AWAITING_PAYMENT'
   | 'PAID_NOT_DELIVERED'
   | 'DELIVERED_PAYMENT_UNCONFIRMED'
-  | 'AWAITING_PAYMENT'
+  | 'AUTHORIZATION_BLOCKED'
   | 'PURCHASE_BLOCKED'
-  | 'DUPLICATE_EVENT_IGNORED'
-  | 'DELIVERY_UNCONFIRMED';
+  | 'PAYMENT_FAILED'
+  | 'STATUS_MISMATCH'
+  | 'UNKNOWN'
+  | 'DELIVERY_UNCONFIRMED'
+  | 'DUPLICATE_EVENT_IGNORED';
 
 export interface PurchaseItem {
   id: string;

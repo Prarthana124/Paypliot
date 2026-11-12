@@ -268,19 +268,119 @@ export function verifyDelivery(purchaseId: string) {
   };
 }
 
+// Validate and consume single-use authorization token (Replay & Tamper Prevention)
+export function validateAndConsumeAuthorizationToken(
+  authorizationId: string,
+  purchaseDetails: {
+    agentId: string;
+    productName: string;
+    merchant: string;
+    amount: number;
+    currency?: string;
+  }
+): { valid: boolean; rejectionReason?: string; rejectionCode?: string } {
+  const currency = purchaseDetails.currency || 'USD';
+  const auth = db.prepare('SELECT * FROM authorizations WHERE id = ?').get(authorizationId) as any;
+
+  if (!auth) {
+    return {
+      valid: false,
+      rejectionCode: 'INVALID_AUTH_ID',
+      rejectionReason: `Authorization token '${authorizationId}' does not exist in registry.`,
+    };
+  }
+
+  // Test F: Replay Prevention (Single-use token)
+  if (auth.status === 'USED') {
+    return {
+      valid: false,
+      rejectionCode: 'TOKEN_ALREADY_USED',
+      rejectionReason: `Replay Attack Blocked: Authorization token '${authorizationId}' has already been consumed for a previous transaction.`,
+    };
+  }
+
+  // Test G: Expired Authorization
+  if (auth.status === 'EXPIRED' || new Date(auth.expires_at).getTime() < Date.now()) {
+    db.prepare("UPDATE authorizations SET status = 'EXPIRED' WHERE id = ?").run(authorizationId);
+    return {
+      valid: false,
+      rejectionCode: 'EXPIRED_AUTHORIZATION',
+      rejectionReason: `Authorization token '${authorizationId}' expired at ${auth.expires_at}.`,
+    };
+  }
+
+  // Test H: Invalid Agent Identity Binding
+  if (auth.agent_id !== purchaseDetails.agentId) {
+    return {
+      valid: false,
+      rejectionCode: 'INVALID_AGENT_IDENTITY',
+      rejectionReason: `Agent Identity Mismatch: Token '${authorizationId}' was issued to '${auth.agent_id}', not '${purchaseDetails.agentId}'.`,
+    };
+  }
+
+  // Test E: Amount Tamper Detection
+  if (purchaseDetails.amount > auth.max_amount) {
+    return {
+      valid: false,
+      rejectionCode: 'MODIFIED_AMOUNT',
+      rejectionReason: `Amount Tampering Blocked: Requested amount $${purchaseDetails.amount.toFixed(2)} exceeds authorized token cap of $${auth.max_amount.toFixed(2)}.`,
+    };
+  }
+
+  // Merchant Binding
+  const authMerchant = auth.merchant.toLowerCase();
+  const reqMerchant = purchaseDetails.merchant.toLowerCase();
+  if (!authMerchant.includes(reqMerchant) && !reqMerchant.includes(authMerchant)) {
+    return {
+      valid: false,
+      rejectionCode: 'UNAUTHORIZED_MERCHANT',
+      rejectionReason: `Merchant Binding Mismatch: Token is bound to '${auth.merchant}', but requested merchant is '${purchaseDetails.merchant}'.`,
+    };
+  }
+
+  // Cryptographic token integrity check
+  const authDataString = `${auth.id}|${auth.agent_id}|${auth.merchant}|${auth.max_amount}|${auth.currency}|${auth.created_at}`;
+  const calculatedHash = computeSha256(authDataString);
+  if (calculatedHash !== auth.hash) {
+    return {
+      valid: false,
+      rejectionCode: 'CRYPTOGRAPHIC_INTEGRITY_VIOLATION',
+      rejectionReason: 'Cryptographic Policy Hash Mismatch: Authorization record was tampered with in storage.',
+    };
+  }
+
+  // Consume token (enforce single-use)
+  db.prepare("UPDATE authorizations SET status = 'USED' WHERE id = ?").run(authorizationId);
+  return { valid: true };
+}
+
 // ==========================================
 // 4. DETERMINISTIC RECONCILIATION ENGINE
 // ==========================================
 export type ReconciliationState =
+  | 'VERIFIED'
   | 'FULLY_VERIFIED'
+  | 'PAYMENT_PENDING'
+  | 'AWAITING_PAYMENT'
   | 'PAID_NOT_DELIVERED'
   | 'DELIVERED_PAYMENT_UNCONFIRMED'
-  | 'AWAITING_PAYMENT'
+  | 'AUTHORIZATION_BLOCKED'
   | 'PURCHASE_BLOCKED'
-  | 'DUPLICATE_EVENT_IGNORED'
-  | 'DELIVERY_UNCONFIRMED';
+  | 'PAYMENT_FAILED'
+  | 'STATUS_MISMATCH'
+  | 'UNKNOWN'
+  | 'DELIVERY_UNCONFIRMED'
+  | 'DUPLICATE_EVENT_IGNORED';
 
-export function runReconciliation(purchaseId: string) {
+export function runReconciliation(
+  purchaseId: string,
+  remotePayPalCheck?: {
+    matches: boolean;
+    remoteStatus?: string;
+    localStatus?: string;
+    discrepancy?: string | null;
+  }
+) {
   const purchase = db.prepare('SELECT * FROM purchases WHERE id = ?').get(purchaseId) as any;
   if (!purchase) {
     throw new Error(`Purchase ${purchaseId} not found`);
@@ -297,15 +397,23 @@ export function runReconciliation(purchaseId: string) {
     ? (db.prepare('SELECT * FROM authorizations WHERE id = ?').get(purchase.authorization_id) as any)
     : null;
 
-  let state: ReconciliationState = 'AWAITING_PAYMENT';
+  let state: ReconciliationState = 'PAYMENT_PENDING';
   let mismatchCategory: string | null = null;
   let evidenceSummary = '';
   let suggestedNextAction = '';
   let severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL' = 'LOW';
 
-  // Rule 1: Authorization violation
-  if (purchase.status === 'BLOCKED' || (auth && auth.status === 'BLOCKED')) {
-    state = 'PURCHASE_BLOCKED';
+  // Rule 0: Remote vs Local Status Mismatch
+  if (remotePayPalCheck && !remotePayPalCheck.matches) {
+    state = 'STATUS_MISMATCH';
+    mismatchCategory = 'PAYPAL_STATE_CONTRADICTION';
+    evidenceSummary = `Local payment status '${remotePayPalCheck.localStatus}' contradicts remote PayPal canonical status '${remotePayPalCheck.remoteStatus}'. Discrepancy: ${remotePayPalCheck.discrepancy}`;
+    suggestedNextAction = 'Investigate potential dropped capture webhooks or race conditions with PayPal canonical ledger.';
+    severity = 'HIGH';
+  }
+  // Rule 1: Authorization violation (Purchase blocked prior to payment)
+  else if (purchase.status === 'BLOCKED' || (auth && auth.status === 'BLOCKED')) {
+    state = 'AUTHORIZATION_BLOCKED';
     mismatchCategory = 'AUTHORIZATION_VIOLATION';
     evidenceSummary = `Autonomous purchase halted by deterministic policy engine: ${auth?.rejection_reason || 'Unauthorized purchase parameters.'}`;
     suggestedNextAction = 'Update agent budget limit or adjust purchasing policy in Authorization Lab.';
@@ -313,41 +421,73 @@ export function runReconciliation(purchaseId: string) {
   }
   // Rule 2: Payment completed vs delivery
   else if (payment && payment.status === 'COMPLETED') {
-    if (latestVerif && latestVerif.status === 'VERIFIED' && latestOp && latestOp.status === 'ACTIVE') {
-      state = 'FULLY_VERIFIED';
+    if (
+      (latestVerif && latestVerif.status === 'VERIFIED') &&
+      (latestOp && (latestOp.status === 'ACTIVE' || latestOp.status === 'PROVISIONED'))
+    ) {
+      state = 'VERIFIED';
       evidenceSummary = `PayPal capture ${payment.capture_id} confirmed and service ${latestOp.service_id} independently verified via HTTP 200 health check.`;
       suggestedNextAction = 'None required. Transaction reconciled successfully.';
       severity = 'LOW';
-    } else if (latestOp && (latestOp.status === 'FAILED' || (latestVerif && latestVerif.status === 'FAILED'))) {
+    } else if (
+      latestOp &&
+      (latestOp.status === 'FAILED' || (latestVerif && latestVerif.status === 'FAILED'))
+    ) {
       state = 'PAID_NOT_DELIVERED';
       mismatchCategory = 'DELIVERY_FAILURE';
-      evidenceSummary = `PayPal capture ${payment.capture_id} succeeded, but digital provisioning failed: ${latestOp.error_message || 'Health probe failed'}.`;
+      evidenceSummary = `PayPal capture ${payment.capture_id} succeeded, but digital provisioning failed: ${latestOp.error_message || 'Health probe failed'}. Customer charged without service delivery.`;
       suggestedNextAction = 'Perform controlled retry of provisioning operation or inspect upstream quota.';
       severity = 'CRITICAL';
-    } else if (latestOp && (latestOp.status === 'TIMEOUT' || latestOp.status === 'UNKNOWN' || (latestVerif && latestVerif.status === 'UNKNOWN'))) {
-      state = 'DELIVERY_UNCONFIRMED';
+    } else if (
+      latestOp &&
+      (latestOp.status === 'TIMEOUT' || latestOp.status === 'UNKNOWN' || (latestVerif && latestVerif.status === 'UNKNOWN'))
+    ) {
+      state = 'UNKNOWN';
       mismatchCategory = 'UNCERTAIN_DELIVERY';
       evidenceSummary = `PayPal capture ${payment.capture_id} succeeded, but provisioning timed out with uncertain endpoint status.`;
       suggestedNextAction = 'Probe service health endpoint before initiating retry to prevent duplicate provisioned resources.';
       severity = 'HIGH';
     } else {
-      state = 'AWAITING_PAYMENT';
+      state = 'PAYMENT_PENDING';
       evidenceSummary = 'Payment confirmed; provisioning queue not yet finished.';
       suggestedNextAction = 'Wait for provisioning orchestrator or run delivery verification.';
       severity = 'MEDIUM';
     }
   }
-  // Rule 3: Service active but payment unconfirmed
-  else if (latestOp && latestOp.status === 'ACTIVE' && (!payment || payment.status !== 'COMPLETED')) {
+  // Rule 3: Service active but payment unconfirmed or declined
+  else if (
+    latestOp &&
+    (latestOp.status === 'ACTIVE' || latestOp.status === 'PROVISIONED') &&
+    (!payment || payment.status !== 'COMPLETED')
+  ) {
     state = 'DELIVERED_PAYMENT_UNCONFIRMED';
     mismatchCategory = 'UNCONFIRMED_PAYMENT';
-    evidenceSummary = `Service ${latestOp.service_id} is active, but PayPal payment status is '${payment?.status || 'NOT_FOUND'}'.`;
+    evidenceSummary = `Service ${latestOp.service_id} is active, but PayPal payment status is '${payment?.status || 'NOT_FOUND'}'. Merchant risk: delivered service without confirmed funds.`;
     suggestedNextAction = 'Query PayPal canonical API directly to verify capture status or initiate authorization recovery.';
     severity = 'HIGH';
   }
-  // Rule 4: Payment pending
+  // Rule 4: Payment explicitly failed or declined with no delivery
+  else if (
+    payment &&
+    (payment.status === 'DECLINED' || payment.status === 'FAILED') &&
+    (!latestOp || latestOp.status === 'NOT_STARTED' || latestOp.status === 'FAILED')
+  ) {
+    state = 'PAYMENT_FAILED';
+    mismatchCategory = 'PAYMENT_DECLINED';
+    evidenceSummary = `PayPal payment ${payment.paypal_order_id} was declined or failed with status '${payment.status}'. No service delivered.`;
+    suggestedNextAction = 'Notify buyer to update payment method or investigate funding instrument.';
+    severity = 'MEDIUM';
+  }
+  // Rule 5: Awaiting payment or capture
+  else if (payment && (payment.status === 'CREATED' || payment.status === 'APPROVED')) {
+    state = 'PAYMENT_PENDING';
+    evidenceSummary = `Order ${payment.paypal_order_id} in status '${payment.status}'. Awaiting buyer authorization or server-side capture execution.`;
+    suggestedNextAction = payment.status === 'APPROVED' ? 'Execute server-side capture of approved order.' : 'Awaiting buyer to complete approval in PayPal Sandbox.';
+    severity = 'LOW';
+  }
+  // Rule 6: Insufficient evidence
   else {
-    state = 'AWAITING_PAYMENT';
+    state = 'PAYMENT_PENDING';
     evidenceSummary = `Awaiting buyer authorization or webhook event from PayPal (current status: ${payment?.status || 'NONE'}).`;
     suggestedNextAction = 'Monitor webhook queue or approve order in PayPal sandbox.';
     severity = 'LOW';
@@ -356,6 +496,7 @@ export function runReconciliation(purchaseId: string) {
   const reconId = `REC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
   const now = new Date().toISOString();
 
+  // Persist canonical reconciliation result
   db.prepare(`
     INSERT INTO reconciliation_results (id, purchase_id, status, mismatch_category, evidence_summary, suggested_next_action, reconciled_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -370,7 +511,7 @@ export function runReconciliation(purchaseId: string) {
   });
 
   // Manage Incidents:
-  if (state !== 'FULLY_VERIFIED' && state !== 'AWAITING_PAYMENT') {
+  if (state !== 'VERIFIED' && state !== 'FULLY_VERIFIED' && state !== 'PAYMENT_PENDING' && state !== 'AWAITING_PAYMENT') {
     const existingInc = db.prepare('SELECT id FROM incidents WHERE purchase_id = ?').get(purchaseId) as any;
     const incId = existingInc ? existingInc.id : `INC-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
@@ -404,7 +545,7 @@ export function runReconciliation(purchaseId: string) {
         VALUES (?, ?, ?, ?, ?, ?, 1, 'PENDING', 'NOT_EXECUTED', ?)
       `).run(propId, incId, purchaseId, actionType, actionName, suggestedNextAction, now);
     }
-  } else {
+  } else if (state === 'VERIFIED' || state === 'FULLY_VERIFIED') {
     // If fully verified, close any open incident
     db.prepare(`
       UPDATE incidents SET status = 'RESOLVED', resolved_at = ? WHERE purchase_id = ? AND status != 'RESOLVED'
